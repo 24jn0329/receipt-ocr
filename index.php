@@ -1,6 +1,6 @@
 <?php
 /**
- * 🧾 レシート解析システム - 修正版 (ロジック最適化)
+ * 🧾 レシート解析システム - 完全統合版 (Azure SQL 1テーブル構成)
  */
 
 // --- 1. 設定と環境構成 ---
@@ -29,10 +29,11 @@ if ($conn === false) {
 if (isset($_GET['action'])) {
     $action = $_GET['action'];
     
+    // CSVエクスポート (新しいReceiptsテーブル構造用)
     if ($action == 'csv') {
         header('Content-Type: text/csv; charset=utf-8');
         header('Content-Disposition: attachment; filename=receipt_export_'.date('Ymd').'.csv');
-        echo "\xEF\xBB\xBF"; 
+        echo "\xEF\xBB\xBF"; // UTF-8 BOM
         $output = fopen('php://output', 'w');
         fputcsv($output, ['ID', 'バッチID', 'ファイル名', '項目名', '金額', '合計フラグ', '登録日時']);
         
@@ -40,13 +41,19 @@ if (isset($_GET['action'])) {
         $stmt = sqlsrv_query($conn, $sql);
         while ($row = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_ASSOC)) {
             fputcsv($output, [
-                $row['id'], $row['upload_batch_id'], $row['file_name'], $row['item_name'], $row['price'], $row['is_total'],
-                $row['created_at'] ? $row['created_at']->format('Y-m-d H:i:s') : ''
+                $row['id'],
+                $row['upload_batch_id'],
+                $row['file_name'],
+                $row['item_name'],
+                $row['price'],
+                $row['is_total'],
+                $row['created_at']->format('Y-m-d H:i:s')
             ]);
         }
         fclose($output); exit;
     }
 
+    // ログダウンロード
     if ($action == 'download_log') {
         if (file_exists($logFile)) {
             header('Content-Type: text/plain');
@@ -55,6 +62,7 @@ if (isset($_GET['action'])) {
         }
     }
 
+    // 表示をクリア
     if ($action == 'clear_view') {
         header("Location: " . strtok($_SERVER["PHP_SELF"], '?'));
         exit;
@@ -66,11 +74,11 @@ $results = [];
 $totalAllAmount = 0;
 
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
-    $batchId = uniqid('BT_'); 
+    $batchId = uniqid('BT_'); // アップロード毎の識別ID
 
     foreach ($_FILES['receipts']['tmp_name'] as $key => $tmpName) {
         if (empty($tmpName)) continue;
-        if ($key > 0) sleep(1); 
+        if ($key > 0) sleep(1); // API負荷軽減
 
         $fileName = $_FILES['receipts']['name'][$key];
         $imgData = file_get_contents($tmpName);
@@ -95,53 +103,52 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
         $currentItems = [];
         $logStore = "不明な店舗";
         $logTotal = 0;
+        $stopFlag = false;
 
-        // 解析ループ
         for ($i = 0; $i < count($lines); $i++) {
             $text = trim($lines[$i]['text']);
-            
-            // 店舗判定
             if ($i < 5 && preg_match('/FamilyMart|セブン|ローソン|LAWSON/i', $text, $storeMatch)) {
                 $logStore = $storeMatch[0];
             }
 
-            // 金額パターン (¥168, \168, 168) を探す
-            if (preg_match('/[¥￥\\]\s?([\d,]+)/u', $text, $matches)) {
+            $pureText = str_replace([' ', '　', '＊', '*', '√', '軽', '轻', '(', ')', '8%', '10%'], '', $text);
+
+            // 合計金額の判定
+            if (preg_match('/合計|合計額/u', $pureText) && preg_match('/[¥￥]([\d,]+)/u', $text, $totalMatch)) {
+                $logTotal = (int)str_replace(',', '', $totalMatch[1]);
+            }
+
+            // 解析停止ワード
+            if (preg_match('/内消費税|消費税|対象|支払|残高|再発行/u', $pureText)) {
+                if (!empty($currentItems)) $stopFlag = true;
+                continue;
+            }
+            if ($stopFlag) continue;
+
+            // 商品と金額の抽出
+            if (preg_match('/[¥￥]([\d,]+)/u', $text, $matches)) {
                 $price = (int)str_replace(',', '', $matches[1]);
+                $nameInLine = trim(preg_replace('/[\.．…]+|[¥￥].*$/u', '', $text));
+                
+                // 「◎」は残し、不要な記号のみクリーニング
+                $cleanNameInLine = str_replace(['＊', '*', '轻', '軽', '(', ')', '.', '．', ' '], '', $nameInLine);
 
-                // 合計行の判定
-                if (preg_match('/合計|合\s+計/u', $text)) {
-                    $logTotal = $price;
-                    continue; 
+                if (mb_strlen($cleanNameInLine) < 2 || preg_match('/^[¥￥\d,\s]+$/u', $cleanNameInLine)) {
+                    $foundName = "";
+                    for ($j = $i - 1; $j >= 0; $j--) {
+                        $prev = trim($lines[$j]['text']);
+                        $cleanPrev = str_replace(['＊', '*', ' ', '√', '軽', '轻'], '', $prev);
+                        if (mb_strlen($cleanPrev) >= 2 && !preg_match('/領|収|証|合|計|%|店|電話|¥|￥/u', $cleanPrev)) {
+                            $foundName = $cleanPrev; break;
+                        }
+                    }
+                    $finalName = $foundName;
+                } else {
+                    $finalName = $cleanNameInLine;
                 }
 
-                // --- 商品名の特定ロジック (ここを大幅修正) ---
-                // 1. 同じ行から金額を除去して名前を抽出
-                $cleanName = trim(preg_replace('/[¥￥\\].*$/u', '', $text));
-                // 不要な記号や税率表記を削除
-                $cleanName = str_replace(['◎', '＊', '*', '軽', '轻', '(', ')', '8%', '10%', '.', '．', ' '], '', $cleanName);
-
-                // 2. 同じ行に名前がない場合、1つ上の行をチェック
-                if (mb_strlen($cleanName) < 2 && $i > 0) {
-                    $prevText = trim($lines[$i-1]['text']);
-                    // 住所や電話番号、日付っぽい行は除外
-                    if (!preg_match('/\d{4}年|[\d-]{10,}|新宿|店|電話|レジ|No/u', $prevText)) {
-                        $cleanName = str_replace(['◎', '＊', '*', '軽', '轻', ' '], '', $prevText);
-                    }
-                }
-
-                // 3. 最終バリデーション
-                if (mb_strlen($cleanName) >= 2 && !preg_match('/合計|消費税|対象|支払|領収|再発行/u', $cleanName)) {
-                    // 重複追加を防止（直前のアイテムと同じ名前・金額ならスキップ）
-                    $isDuplicate = false;
-                    if (!empty($currentItems)) {
-                        $last = end($currentItems);
-                        if ($last['name'] === $cleanName && $last['price'] === $price) $isDuplicate = true;
-                    }
-
-                    if (!$isDuplicate) {
-                        $currentItems[] = ['name' => $cleanName, 'price' => $price];
-                    }
+                if (!empty($finalName) && !preg_match('/Family|新宿|電話|登録|領収|対象|消費税|合計|内訳/u', $finalName)) {
+                    $currentItems[] = ['name' => $finalName, 'price' => $price];
                 }
             }
         }
@@ -171,7 +178,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>レシート解析システム (修正版)</title>
+    <title>レシート解析システム (Azure SQL 統合版)</title>
     <style>
         body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #f4f7f9; padding: 20px; color: #333; }
         .box { max-width: 600px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.05); }
@@ -230,7 +237,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
     </div>
 
     <script>
-    // JS部分は圧縮処理を含む元のロジックを継承
     document.getElementById('uploadForm').onsubmit = async function(e) {
         e.preventDefault();
         const btn = document.getElementById('submitBtn');
