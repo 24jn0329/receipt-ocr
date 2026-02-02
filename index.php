@@ -11,16 +11,16 @@
 @set_time_limit(600);
 @ini_set('memory_limit', '512M');
 
-$endpoint = "https://24jn0321.cognitiveservices.azure.com/"; 
-$apiKey   = "BQGkM056pMBAB5KVI6wmcSLBf2JlF8X2UUiwxw5N17K9QmWljMG3JQQJ99CAACi0881XJ3w3AAAFACOGrT37"; 
+$endpoint = "https://cv-receipt.cognitiveservices.azure.com/"; 
+$apiKey   = "acFa9r1gRfWfvNsBjsLFsyec437ihmUsWXpA1WKVYD4z5yrPBrrMJQQJ99CBACNns7RXJ3w3AAAFACOGcllL"; 
 $logFile = 'ocr.log';
 
 // --- 2. Azure SQL 接続設定 ---
-$serverName = "tcp:receipt-server-24jn0.database.windows.net,1433"; 
+$serverName = "tcp:receipt-server.database.windows.net,1433"; 
 $connectionOptions = array(
-    "Database" => "receiptdb",
-    "Uid" => "sqladmin",
-    "PWD" => "Abc842727925",
+    "Database" => "db_receipt",
+    "Uid" => "jn240329",
+    "PWD" => "15828415312dY",
     "CharacterSet" => "UTF-8"
 );
 $conn = sqlsrv_connect($serverName, $connectionOptions);
