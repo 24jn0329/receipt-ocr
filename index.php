@@ -1,17 +1,15 @@
 <?php
 /**
  * 🧾 小票解析系统 - 修复版 (兼容 Azure Free Tier F0)
- * 请保存为 index.php
  */
 
-// --- 1. 配置 (请填入你重置后的新 Key) ---
+// --- 1. 配置 ---
 @set_time_limit(600);
 @ini_set('memory_limit', '512M');
 
 // ★★★ 请在这里填入新的 Key，不要用刚才那个泄露的 ★★★
-// 注意：Endpoint 格式通常是 https://你的名字.cognitiveservices.azure.com/
 $endpoint = "https://cv-receipt.cognitiveservices.azure.com/"; 
-$apiKey   = "YOUR_NEW_AZURE_KEY_HERE"; // 【重要】请填入重置后的 Key1
+$apiKey   = "acFa9r1gRfWfvNsBjsLFsyec437ihmUsWXpA1WKVYD4z5yrPBrrMJQQJ99CBACNns7RXJ3w3AAAFACOGcllL"; // 请务必更换新的 Key
 
 $logFile = 'ocr.log';
 
@@ -20,15 +18,14 @@ $serverName = "tcp:receipt-server.database.windows.net,1433";
 $connectionOptions = array(
     "Database" => "db_receipt",
     "Uid" => "jn240329",
-    "PWD" => "YOUR_NEW_DB_PASSWORD_HERE", // 【重要】请填入重置后的数据库密码
+    "PWD" => "15828415312dY", // 请务必更换新的数据库密码
     "CharacterSet" => "UTF-8"
 );
-
-// 尝试连接
+// 尝试连接，如果失败友好提示
 $conn = sqlsrv_connect($serverName, $connectionOptions);
-// 如果连接失败，不报错 404，而是显示具体原因
 if ($conn === false) {
-    die("<h3>数据库连接失败</h3><p>请检查：1.密码是否正确 2.防火墙是否开启 Allow Azure services</p>");
+    // 为了防止页面报错难看，只输出简单错误，不输出详细连接信息
+    die("Database Connection Error. 请检查数据库防火墙和密码设置。");
 }
 
 // --- 3. 动作处理 (CSV/下载/清空) ---
@@ -42,7 +39,7 @@ if (isset($_GET['action'])) {
         $output = fopen('php://output', 'w');
         fputcsv($output, ['文件名', '项目', '金额', '日期']);
         
-        $sql = "SELECT r.file_name, r.created_at, i.item_name, i.price FROM Receipts r JOIN receipt_items i ON r.id = i.receipt_id";
+        $sql = "SELECT r.file_name, r.created_at, i.item_name, i.price FROM receipts r JOIN receipt_items i ON r.id = i.receipt_id";
         $stmt = sqlsrv_query($conn, $sql);
         if ($stmt) {
             while ($row = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_ASSOC)) {
@@ -67,7 +64,7 @@ if (isset($_GET['action'])) {
     }
 }
 
-// --- 4. OCR 核心解析逻辑 (使用 v3.2 API - 异步模式) ---
+// --- 4. OCR 核心解析逻辑 (使用 Read API v3.2 - 异步模式) ---
 $processedIds = []; 
 
 // 辅助函数：调用 Azure Read API (异步)
@@ -98,13 +95,13 @@ function callAzureReadAPI($endpoint, $apiKey, $imgData) {
         return null; // 请求失败
     }
 
-    // 2. 获取结果 URL (Operation-Location)
+    // 2. 获取结果 URL
     if (!preg_match('/Operation-Location: (.*)/i', $respHeader, $matches)) {
         return null;
     }
     $resultUrl = trim($matches[1]);
 
-    // 3. 轮询结果 (GET) - 最多等10秒
+    // 3. 轮询结果 (GET)
     $maxRetries = 10;
     for ($i = 0; $i < $maxRetries; $i++) {
         sleep(1); // 等待处理
@@ -134,7 +131,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
         $fileName = $_FILES['receipts']['name'][$key];
         $imgData = file_get_contents($tmpName);
         
-        // 调用 v3.2 API (替换了原来的 Sync API)
+        // 调用 v3.2 API
         $data = callAzureReadAPI($endpoint, $apiKey, $imgData);
 
         if (!$data) continue;
@@ -147,43 +144,37 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
         $logStore = "Unknown";
         $logTotal = 0;
 
-        // --- 解析逻辑 (针对全家便利店优化) ---
+        // --- 解析逻辑 (保持不变) ---
         for ($i = 0; $i < count($lines); $i++) {
             $text = trim($lines[$i]['text']);
             
-            // 店铺识别
-            if ($i < 10 && preg_match('/FamilyMart|セブン|ローソン/i', $text, $storeMatch)) {
+            if ($i < 5 && preg_match('/FamilyMart|セブン|ローソン|LAWSON/i', $text, $storeMatch)) {
                 $logStore = $storeMatch[0];
             }
 
             $pureText = str_replace([' ', '　', '＊', '*', '√', '軽', '轻', '(', ')', '8%', '10%'], '', $text);
 
-            // 合计金额识别
-            if (preg_match('/合計|合计/u', $pureText) && preg_match('/[¥￥]?([\d,]+)/u', $text, $totalMatch)) {
+            if (preg_match('/合計|合计/u', $pureText) && preg_match('/[¥￥]([\d,]+)/u', $text, $totalMatch)) {
                 $logTotal = (float)str_replace(',', '', $totalMatch[1]);
             }
 
-            // 结束标志
             if (preg_match('/内消費税|消費税|対象|支払|残高|再発行/u', $pureText)) {
                 if (!empty($currentItems)) $stopFlag = true; 
                 continue; 
             }
             if ($stopFlag) continue;
 
-            // 商品行识别 (行末是金额)
-            if (preg_match('/[¥￥]?([\d,]+)$/u', $text, $matches)) {
+            if (preg_match('/[¥￥]([\d,]+)/u', $text, $matches)) {
                 $price = (int)str_replace(',', '', $matches[1]);
-                $nameInLine = trim(preg_replace('/[\.．…]+|[¥￥]?[\d,]+$/u', '', $text)); // 去掉金额
+                $nameInLine = trim(preg_replace('/[\.．…]+|[¥￥].*$/u', '', $text));
                 $cleanNameInLine = str_replace(['＊', '*', '轻', '軽', '(', ')', '.', '．', ' '], '', $nameInLine);
 
-                // 如果名字太短或全是数字，尝试去上一行找名字
                 if (mb_strlen($cleanNameInLine) < 2 || preg_match('/^[¥￥\d,\s]+$/u', $cleanNameInLine)) {
                     $foundName = "";
-                    for ($j = $i - 1; $j >= max(0, $i-2); $j--) {
+                    for ($j = $i - 1; $j >= 0; $j--) {
                         $prev = trim($lines[$j]['text']);
                         $cleanPrev = str_replace(['＊', '*', ' ', '√', '軽', '轻'], '', $prev);
-                        // 排除无效行
-                        if (mb_strlen($cleanPrev) >= 2 && !preg_match('/領|収|証|合|计|計|%|店|电话|電話|¥|￥|\d{4}/u', $cleanPrev)) {
+                        if (mb_strlen($cleanPrev) >= 2 && !preg_match('/領|収|証|合|计|計|%|店|电话|電話|¥|￥/u', $cleanPrev)) {
                             $foundName = $cleanPrev; break;
                         }
                     }
@@ -192,9 +183,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
                     $finalName = $cleanNameInLine;
                 }
 
-                // 最终过滤
-                if (!empty($finalName) && !preg_match('/Family|新宿|電話|登録|領収|対象|消費税|合計|内訳|お預|釣/u', $finalName)) {
-                    $currentItems[] = ['name' => $finalName, 'price' => $price];
+                if (!empty($finalName) && !preg_match('/Family|新宿|電話|登録|領収|対象|消費税|合計|内訳/u', $finalName)) {
+                    $isDuplicate = false;
+                    foreach ($currentItems as $existing) {
+                        if ($existing['name'] === $finalName && $existing['price'] === $price) {
+                            $isDuplicate = true; break;
+                        }
+                    }
+                    if (!$isDuplicate) {
+                        $currentItems[] = ['name' => $finalName, 'price' => $price];
+                    }
                 }
             }
         }
@@ -225,7 +223,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
     }
 }
 
-// --- 5. 显示逻辑 ---
+// --- 5. 显示逻辑 (从 DB 读取刚插入的数据) ---
 $results = [];
 $totalAllAmount = 0;
 
@@ -270,52 +268,4 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && !empty($processedIds)) {
     </style>
 </head>
 <body>
-    <div class="box">
-        <h2 style="text-align:center;">📜 小票解析 (修复版)</h2>
-        <form id="uploadForm" method="post" enctype="multipart/form-data">
-            <input type="file" id="fileInput" name="receipts[]" multiple required style="margin-bottom:20px; width: 100%;">
-            <button type="submit" id="submitBtn" class="btn-main">开始解析并存入DB</button>
-            <div id="status" style="display:none; text-align:center; margin-top:10px; color:#1890ff;">准备中...</div>
-        </form>
-
-        <?php if ($results): ?>
-            <div style="margin-top:30px;">
-                <h3 style="font-size: 16px; color: #1890ff;">✅ 本次解析结果：</h3>
-                <?php foreach ($results as $res): ?>
-                    <div class="card">
-                        <small style="color:#aaa;">📄 <?= htmlspecialchars($res['file']) ?></small>
-                        <?php foreach ($res['items'] as $it): ?>
-                            <div class="row">
-                                <span><?= htmlspecialchars($it['name']) ?></span>
-                                <span>¥<?= number_format($it['price']) ?></span>
-                            </div>
-                        <?php endforeach; ?>
-                    </div>
-                <?php endforeach; ?>
-                <div class="grand-total">
-                    <div>本次解析总金額</div>
-                    <div class="amount-big">¥<?= number_format($totalAllAmount) ?></div>
-                </div>
-            </div>
-        <?php endif; ?>
-
-        <div class="nav-bar">
-            <a href="?action=csv" class="nav-link">📥 导出 CSV</a>
-            <a href="?action=download_log" class="nav-link">📝 下载日志</a>
-            <a href="?action=clear_view" class="nav-link" style="color:#1890ff;">🔄 清空页面</a>
-        </div>
-    </div>
-
-    <script>
-    document.getElementById('uploadForm').onsubmit = function(e) {
-        // 简单处理，不使用JS压缩以免复杂化，直接提交表单
-        const btn = document.getElementById('submitBtn');
-        const status = document.getElementById('status');
-        btn.disabled = true;
-        btn.innerText = "正在处理中，请稍候...";
-        status.style.display = "block";
-        status.innerText = "正在上传图片并请求 Azure OCR...";
-    };
-    </script>
-</body>
-</html>
+    <div class
