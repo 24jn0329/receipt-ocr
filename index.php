@@ -1,34 +1,37 @@
 <?php
 /**
- * 🧾 小票解析系统 - 页面重置版
- * 修改说明：
- * 1. 允许显示并保存带有 "◎" 符号的商品名。
- * 2. 移除数据库删除功能，改为“清空页面显示”。
- * 3. 增强日志功能：按照指定格式 [STORE/TOTAL/ITEM] 写入 ocr.log
+ * 🧾 小票解析系统 - 修复版 (兼容 Azure Free Tier F0)
+ * 请保存为 index.php
  */
 
-// --- 1. 配置与環境設置 ---
+// --- 1. 配置 (请填入你重置后的新 Key) ---
 @set_time_limit(600);
 @ini_set('memory_limit', '512M');
 
+// ★★★ 请在这里填入新的 Key，不要用刚才那个泄露的 ★★★
+// 注意：Endpoint 格式通常是 https://你的名字.cognitiveservices.azure.com/
 $endpoint = "https://cv-receipt.cognitiveservices.azure.com/"; 
-$apiKey   = "acFa9r1gRfWfvNsBjsLFsyec437ihmUsWXpA1WKVYD4z5yrPBrrMJQQJ99CBACNns7RXJ3w3AAAFACOGcllL"; 
+$apiKey   = "YOUR_NEW_AZURE_KEY_HERE"; // 【重要】请填入重置后的 Key1
+
 $logFile = 'ocr.log';
 
-// --- 2. Azure SQL 接続設定 ---
+// --- 2. Azure SQL 连接 ---
 $serverName = "tcp:receipt-server.database.windows.net,1433"; 
 $connectionOptions = array(
     "Database" => "db_receipt",
     "Uid" => "jn240329",
-    "PWD" => "15828415312dY",
+    "PWD" => "YOUR_NEW_DB_PASSWORD_HERE", // 【重要】请填入重置后的数据库密码
     "CharacterSet" => "UTF-8"
 );
+
+// 尝试连接
 $conn = sqlsrv_connect($serverName, $connectionOptions);
+// 如果连接失败，不报错 404，而是显示具体原因
 if ($conn === false) {
-    die("<pre>" . print_r(sqlsrv_errors(), true) . "</pre>");
+    die("<h3>数据库连接失败</h3><p>请检查：1.密码是否正确 2.防火墙是否开启 Allow Azure services</p>");
 }
 
-// --- 3. 动作处理 ---
+// --- 3. 动作处理 (CSV/下载/清空) ---
 if (isset($_GET['action'])) {
     $action = $_GET['action'];
     
@@ -38,10 +41,14 @@ if (isset($_GET['action'])) {
         echo "\xEF\xBB\xBF"; 
         $output = fopen('php://output', 'w');
         fputcsv($output, ['文件名', '项目', '金额', '日期']);
-        $sql = "SELECT r.file_name, r.processed_at, i.item_name, i.price FROM receipts r JOIN receipt_items i ON r.id = i.receipt_id";
+        
+        $sql = "SELECT r.file_name, r.created_at, i.item_name, i.price FROM Receipts r JOIN receipt_items i ON r.id = i.receipt_id";
         $stmt = sqlsrv_query($conn, $sql);
-        while ($row = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_ASSOC)) {
-            fputcsv($output, [$row['file_name'], $row['item_name'], $row['price'], $row['processed_at']->format('Y-m-d H:i:s')]);
+        if ($stmt) {
+            while ($row = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_ASSOC)) {
+                $dateStr = $row['created_at'] ? $row['created_at']->format('Y-m-d H:i:s') : '';
+                fputcsv($output, [$row['file_name'], $row['item_name'], $row['price'], $dateStr]);
+            }
         }
         fclose($output); exit;
     }
@@ -60,71 +67,123 @@ if (isset($_GET['action'])) {
     }
 }
 
-// --- 4. OCR 核心解析逻辑 ---
+// --- 4. OCR 核心解析逻辑 (使用 v3.2 API - 异步模式) ---
 $processedIds = []; 
+
+// 辅助函数：调用 Azure Read API (异步)
+function callAzureReadAPI($endpoint, $apiKey, $imgData) {
+    // 1. 发送请求 (POST)
+    $url = rtrim($endpoint, '/') . "/vision/v3.2/read/analyze";
+    $headers = [
+        "Content-Type: application/octet-stream",
+        "Ocp-Apim-Subscription-Key: $apiKey"
+    ];
+
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $imgData);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HEADER, true); // 获取 Header
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    $respHeader = substr($response, 0, $headerSize);
+    curl_close($ch);
+
+    if ($httpCode != 202) {
+        return null; // 请求失败
+    }
+
+    // 2. 获取结果 URL (Operation-Location)
+    if (!preg_match('/Operation-Location: (.*)/i', $respHeader, $matches)) {
+        return null;
+    }
+    $resultUrl = trim($matches[1]);
+
+    // 3. 轮询结果 (GET) - 最多等10秒
+    $maxRetries = 10;
+    for ($i = 0; $i < $maxRetries; $i++) {
+        sleep(1); // 等待处理
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $resultUrl);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ["Ocp-Apim-Subscription-Key: $apiKey"]);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        $jsonResponse = curl_exec($ch);
+        curl_close($ch);
+
+        $data = json_decode($jsonResponse, true);
+        if (($data['status'] ?? '') === 'succeeded') {
+            return $data;
+        }
+        if (($data['status'] ?? '') === 'failed') {
+            return null;
+        }
+    }
+    return null; // 超时
+}
+
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
     foreach ($_FILES['receipts']['tmp_name'] as $key => $tmpName) {
         if (empty($tmpName)) continue;
-        if ($key > 0) sleep(1);
-
+        
         $fileName = $_FILES['receipts']['name'][$key];
         $imgData = file_get_contents($tmpName);
-        $apiUrl = rtrim($endpoint, '/') . "/computervision/imageanalysis:analyze?api-version=2023-10-01&features=read";
         
-        $ch = curl_init($apiUrl);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/octet-stream', 'Ocp-Apim-Subscription-Key: ' . $apiKey]);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $imgData);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+        // 调用 v3.2 API (替换了原来的 Sync API)
+        $data = callAzureReadAPI($endpoint, $apiKey, $imgData);
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+        if (!$data) continue;
 
-        if ($httpCode !== 200) continue;
-
-        $data = json_decode($response, true);
-        $lines = $data['readResult']['blocks'][0]['lines'] ?? [];
+        // v3.2 的结构是 analyzeResult -> readResults -> lines
+        $lines = $data['analyzeResult']['readResults'][0]['lines'] ?? [];
         $currentItems = [];
         $stopFlag = false;
         
-        // 日志用の変数
         $logStore = "Unknown";
         $logTotal = 0;
 
+        // --- 解析逻辑 (针对全家便利店优化) ---
         for ($i = 0; $i < count($lines); $i++) {
             $text = trim($lines[$i]['text']);
             
-            // 店舗名の推測 (最初の数行から)
-            if ($i < 5 && preg_match('/FamilyMart|セブン|ローソン|LAWSON/i', $text, $storeMatch)) {
+            // 店铺识别
+            if ($i < 10 && preg_match('/FamilyMart|セブン|ローソン/i', $text, $storeMatch)) {
                 $logStore = $storeMatch[0];
             }
 
             $pureText = str_replace([' ', '　', '＊', '*', '√', '軽', '轻', '(', ')', '8%', '10%'], '', $text);
 
-            if (preg_match('/合計|合计/u', $pureText) && preg_match('/[¥￥]([\d,]+)/u', $text, $totalMatch)) {
+            // 合计金额识别
+            if (preg_match('/合計|合计/u', $pureText) && preg_match('/[¥￥]?([\d,]+)/u', $text, $totalMatch)) {
                 $logTotal = (float)str_replace(',', '', $totalMatch[1]);
             }
 
+            // 结束标志
             if (preg_match('/内消費税|消費税|対象|支払|残高|再発行/u', $pureText)) {
                 if (!empty($currentItems)) $stopFlag = true; 
                 continue; 
             }
             if ($stopFlag) continue;
 
-            if (preg_match('/[¥￥]([\d,]+)/u', $text, $matches)) {
+            // 商品行识别 (行末是金额)
+            if (preg_match('/[¥￥]?([\d,]+)$/u', $text, $matches)) {
                 $price = (int)str_replace(',', '', $matches[1]);
-                $nameInLine = trim(preg_replace('/[\.．…]+|[¥￥].*$/u', '', $text));
+                $nameInLine = trim(preg_replace('/[\.．…]+|[¥￥]?[\d,]+$/u', '', $text)); // 去掉金额
                 $cleanNameInLine = str_replace(['＊', '*', '轻', '軽', '(', ')', '.', '．', ' '], '', $nameInLine);
 
+                // 如果名字太短或全是数字，尝试去上一行找名字
                 if (mb_strlen($cleanNameInLine) < 2 || preg_match('/^[¥￥\d,\s]+$/u', $cleanNameInLine)) {
                     $foundName = "";
-                    for ($j = $i - 1; $j >= 0; $j--) {
+                    for ($j = $i - 1; $j >= max(0, $i-2); $j--) {
                         $prev = trim($lines[$j]['text']);
                         $cleanPrev = str_replace(['＊', '*', ' ', '√', '軽', '轻'], '', $prev);
-                        if (mb_strlen($cleanPrev) >= 2 && !preg_match('/領|収|証|合|计|計|%|店|电话|電話|¥|￥/u', $cleanPrev)) {
+                        // 排除无效行
+                        if (mb_strlen($cleanPrev) >= 2 && !preg_match('/領|収|証|合|计|計|%|店|电话|電話|¥|￥|\d{4}/u', $cleanPrev)) {
                             $foundName = $cleanPrev; break;
                         }
                     }
@@ -133,21 +192,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
                     $finalName = $cleanNameInLine;
                 }
 
-                if (!empty($finalName) && !preg_match('/Family|新宿|電話|登録|領収|対象|消費税|合計|内訳/u', $finalName)) {
-                    $isDuplicate = false;
-                    foreach ($currentItems as $existing) {
-                        if ($existing['name'] === $finalName && $existing['price'] === $price) {
-                            $isDuplicate = true; break;
-                        }
-                    }
-                    if (!$isDuplicate) {
-                        $currentItems[] = ['name' => $finalName, 'price' => $price];
-                    }
+                // 最终过滤
+                if (!empty($finalName) && !preg_match('/Family|新宿|電話|登録|領収|対象|消費税|合計|内訳|お預|釣/u', $finalName)) {
+                    $currentItems[] = ['name' => $finalName, 'price' => $price];
                 }
             }
         }
 
-        // --- 指定フォーマットでのログ書き出し ---
+        // 写入 Log
         $logContent = "\n===== OCR RESULT =====\n";
         $logContent .= "TIME: " . date('Y-m-d\TH:i:s.v') . "\n";
         $logContent .= "STORE: $logStore\n";
@@ -156,10 +208,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
             $logContent .= "{$it['name']}," . number_format($it['price'], 1, '.', '') . "\n";
         }
         file_put_contents($logFile, $logContent, FILE_APPEND);
-        // -------------------------------------
 
+        // 写入 DB
         if (!empty($currentItems)) {
-            $sqlR = "INSERT INTO receipts (file_name) OUTPUT INSERTED.id VALUES (?)";
+            $sqlR = "INSERT INTO Receipts (file_name) OUTPUT INSERTED.id VALUES (?)";
             $stmtR = sqlsrv_query($conn, $sqlR, array($fileName));
             if ($stmtR && sqlsrv_fetch($stmtR)) {
                 $newId = sqlsrv_get_field($stmtR, 0);
@@ -173,22 +225,24 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
     }
 }
 
-// --- 5. 表示用データの読み取り ---
+// --- 5. 显示逻辑 ---
 $results = [];
 $totalAllAmount = 0;
 
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && !empty($processedIds)) {
     $idList = implode(',', $processedIds);
-    $sqlMain = "SELECT id, file_name FROM receipts WHERE id IN ($idList)";
+    $sqlMain = "SELECT id, file_name FROM Receipts WHERE id IN ($idList)";
     $resMain = sqlsrv_query($conn, $sqlMain);
     if ($resMain) {
         while ($row = sqlsrv_fetch_array($resMain, SQLSRV_FETCH_ASSOC)) {
             $items = [];
             $sqlSub = "SELECT item_name as name, price FROM receipt_items WHERE receipt_id = ? ORDER BY id ASC";
             $resSub = sqlsrv_query($conn, $sqlSub, array($row['id']));
-            while ($it = sqlsrv_fetch_array($resSub, SQLSRV_FETCH_ASSOC)) {
-                $items[] = $it;
-                $totalAllAmount += $it['price'];
+            if ($resSub) {
+                while ($it = sqlsrv_fetch_array($resSub, SQLSRV_FETCH_ASSOC)) {
+                    $items[] = $it;
+                    $totalAllAmount += $it['price'];
+                }
             }
             $results[] = ['file' => $row['file_name'], 'items' => $items];
         }
@@ -217,7 +271,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && !empty($processedIds)) {
 </head>
 <body>
     <div class="box">
-        <h2 style="text-align:center;">📜 小票解析 (仅显示本次)</h2>
+        <h2 style="text-align:center;">📜 小票解析 (修复版)</h2>
         <form id="uploadForm" method="post" enctype="multipart/form-data">
             <input type="file" id="fileInput" name="receipts[]" multiple required style="margin-bottom:20px; width: 100%;">
             <button type="submit" id="submitBtn" class="btn-main">开始解析并存入DB</button>
@@ -253,54 +307,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && !empty($processedIds)) {
     </div>
 
     <script>
-    document.getElementById('uploadForm').onsubmit = async function(e) {
-        e.preventDefault();
+    document.getElementById('uploadForm').onsubmit = function(e) {
+        // 简单处理，不使用JS压缩以免复杂化，直接提交表单
         const btn = document.getElementById('submitBtn');
         const status = document.getElementById('status');
-        const files = document.getElementById('fileInput').files;
-        if (!files.length) return;
-
         btn.disabled = true;
+        btn.innerText = "正在处理中，请稍候...";
         status.style.display = "block";
-
-        const formData = new FormData();
-        for (let i = 0; i < files.length; i++) {
-            status.innerText = `正在压缩处理 (${i+1}/${files.length})...`;
-            const compressed = await compressImg(files[i]);
-            formData.append('receipts[]', compressed, files[i].name);
-        }
-
-        status.innerText = "正在发送至 Azure 识别...";
-        fetch('', { method: 'POST', body: formData })
-        .then(r => r.text())
-        .then(html => {
-            const doc = new DOMParser().parseFromString(html, 'text/html');
-            document.body.innerHTML = doc.body.innerHTML;
-        })
-        .catch(err => {
-            alert("上传失败，请检查日志。");
-            btn.disabled = false;
-        });
+        status.innerText = "正在上传图片并请求 Azure OCR...";
     };
-
-    function compressImg(file) {
-        return new Promise(resolve => {
-            const reader = new FileReader();
-            reader.readAsDataURL(file);
-            reader.onload = (e) => {
-                const img = new Image();
-                img.src = e.target.result;
-                img.onload = () => {
-                    const canvas = document.createElement('canvas');
-                    let w = img.width, h = img.height;
-                    if (w > 1200) { h = h * (1200/w); w = 1200; }
-                    canvas.width = w; canvas.height = h;
-                    canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-                    canvas.toBlob(blob => resolve(new File([blob], file.name, {type:'image/jpeg'})), 'image/jpeg', 0.85);
-                };
-            };
-        });
-    }
     </script>
 </body>
 </html>
