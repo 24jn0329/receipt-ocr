@@ -1,6 +1,6 @@
 <?php
 /**
- * 🧾 レシート解析システム - 抽出ロジック大幅強化版
+ * 🧾 レシート解析システム - 最終精度向上版
  */
 
 // --- 1. 設定と環境構成 ---
@@ -25,7 +25,7 @@ if ($conn === false) {
     die("<pre>" . print_r(sqlsrv_errors(), true) . "</pre>");
 }
 
-// --- 3. アクション処理 ---
+// --- 3. アクション処理 (CSV/Log/Clear) ---
 if (isset($_GET['action'])) {
     $action = $_GET['action'];
     if ($action == 'csv') {
@@ -84,56 +84,48 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
         $lines = $data['readResult']['blocks'][0]['lines'] ?? [];
         $currentItems = [];
         $logTotal = 0;
-        $stopFlag = false;
+        $potentialNames = []; // 金額が見つかる前のテキスト行を保持
 
-        for ($i = 0; $i < count($lines); $i++) {
-            $text = trim($lines[$i]['text']);
-            // クリーニング：記号や税率表記を除去
-            $pureText = str_replace([' ', '　', '＊', '*', '√', '軽', '轻', '(', ')', '8%', '10%', '税'], '', $text);
-
-            // ① 合計金額の検出（判定用。この行以降は商品解析を停止する準備）
+        foreach ($lines as $line) {
+            $text = trim($line['text']);
+            // 判定用クリーニング
+            $pureText = str_replace([' ', '　', '＊', '*', '√', '軽', '轻', '(', ')', '8%', '10%', '税', '.', '．', '…'], '', $text);
+            
+            // ① 合計金額を見つけたら解析終了モードへ
             if (preg_match('/合計|合計額|小計/u', $pureText)) {
                 if (preg_match('/[¥￥]([\d,]+)/u', $text, $totalMatch)) {
                     $logTotal = (int)str_replace(',', '', $totalMatch[1]);
                 }
-                $stopFlag = true;
-                continue;
+                break; // 合計以降は読まない
             }
 
-            // ② 支払い関連などの終了キーワード
-            if (preg_match('/支払|残高|再発行|クレジット|預り|釣銭/u', $pureText)) {
-                $stopFlag = true;
-                continue;
-            }
-
-            if ($stopFlag) continue;
-
-            // ③ 商品と金額の抽出ロジック（強化版）
+            // ② 金額(¥)が含まれているかチェック
             if (preg_match('/[¥￥]([\d,]+)/u', $text, $matches)) {
                 $price = (int)str_replace(',', '', $matches[1]);
                 
-                // 行内から金額以外の部分を抽出
+                // 同じ行に名前があるか確認
                 $namePart = trim(preg_replace('/[¥￥][\d,]+.*/u', '', $text));
                 $cleanName = str_replace(['＊', '*', '轻', '軽', '(', ')', '.', '．', ' ', '　'], '', $namePart);
 
-                // 【修正ポイント】名前が空または短すぎる場合、上の行から名前を取得
-                if (mb_strlen($cleanName) < 1) {
-                    for ($j = $i - 1; $j >= 0; $j--) {
-                        $prevText = trim($lines[$j]['text']);
-                        // 住所、電話、タイトル、空行などはスキップ
-                        if (preg_match('/Family|新宿|電話|番号|登録|領収|証|http/u', $prevText)) break;
-                        
-                        $cleanPrev = str_replace(['＊', '*', ' ', '　', '√', '軽', '轻'], '', $prevText);
-                        if (mb_strlen($cleanPrev) >= 2) {
-                            $cleanName = $cleanPrev;
-                            break;
-                        }
-                    }
+                // 行に名前がない場合、直前の有効な行を名前として採用
+                if (mb_strlen($cleanName) < 1 && !empty($potentialNames)) {
+                    $cleanName = end($potentialNames);
                 }
 
-                // 最终过滤并存储结果
-                if (!empty($cleanName) && !preg_match('/Family|新宿|電話|登録|領収|証|対象|消費税|合計|内訳/u', $cleanName)) {
-                    $currentItems[] = ['name' => $cleanName, 'price' => $price];
+                // 除外ワードチェック（店舗情報やヘッダーを排除）
+                if (!empty($cleanName) && !preg_match('/Family|新宿|電話|番号|登録|領収|http|：/u', $cleanName)) {
+                    // 同じ名前が連続して登録されるのを防止（OCRの重複読み対策）
+                    $isDuplicate = false;
+                    foreach ($currentItems as $ci) { if ($ci['name'] == $cleanName) $isDuplicate = true; }
+                    
+                    if (!$isDuplicate) {
+                        $currentItems[] = ['name' => $cleanName, 'price' => $price];
+                    }
+                }
+            } else {
+                // 金额のない行は、商品名の候補として保存
+                if (mb_strlen($pureText) >= 2 && !preg_match('/Family|新宿|電話|番号|登録|領収|http|No/u', $pureText)) {
+                    $potentialNames[] = $pureText;
                 }
             }
         }
@@ -156,7 +148,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>レシート解析システム</title>
     <style>
         body { font-family: sans-serif; background: #f4f7f9; padding: 20px; }
@@ -174,7 +165,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
         <form id="uploadForm" method="post" enctype="multipart/form-data">
             <input type="file" id="fileInput" name="receipts[]" multiple required style="margin-bottom:20px; width: 100%;">
             <button type="submit" id="submitBtn" class="btn-main">解析を開始してDBに保存</button>
-            <div id="status" style="display:none; text-align:center; margin-top:10px; color:#1890ff;">準備中...</div>
+            <div id="status" style="display:none; text-align:center; margin-top:10px; color:#1890ff;">解析中...</div>
         </form>
 
         <?php if (!empty($results)): ?>
@@ -206,52 +197,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
             <a href="?action=clear_view">🔄 クリア</a>
         </div>
     </div>
-
     <script>
     document.getElementById('uploadForm').onsubmit = async function(e) {
-        e.preventDefault();
-        const btn = document.getElementById('submitBtn');
-        const status = document.getElementById('status');
-        const files = document.getElementById('fileInput').files;
-        if (!files.length) return;
-
-        btn.disabled = true;
-        status.style.display = "block";
-
-        const formData = new FormData();
-        for (let i = 0; i < files.length; i++) {
-            status.innerText = `圧縮中 (${i+1}/${files.length})...`;
-            const compressed = await compressImg(files[i]);
-            formData.append('receipts[]', compressed, files[i].name);
-        }
-
-        status.innerText = "Azure OCR で解析中...";
-        fetch('', { method: 'POST', body: formData })
-        .then(r => r.text())
-        .then(html => {
-            const doc = new DOMParser().parseFromString(html, 'text/html');
-            document.body.innerHTML = doc.body.innerHTML;
-        });
+        document.getElementById('submitBtn').disabled = true;
+        document.getElementById('status').style.display = "block";
     };
-
-    function compressImg(file) {
-        return new Promise(resolve => {
-            const reader = new FileReader();
-            reader.readAsDataURL(file);
-            reader.onload = (e) => {
-                const img = new Image();
-                img.src = e.target.result;
-                img.onload = () => {
-                    const canvas = document.createElement('canvas');
-                    let w = img.width, h = img.height;
-                    if (w > 1200) { h = h * (1200/w); w = 1200; }
-                    canvas.width = w; canvas.height = h;
-                    canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-                    canvas.toBlob(blob => resolve(new File([blob], file.name, {type:'image/jpeg'})), 'image/jpeg', 0.85);
-                };
-            };
-        });
-    }
     </script>
 </body>
 </html>
