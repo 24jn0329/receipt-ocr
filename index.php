@@ -1,8 +1,9 @@
 <?php
 /**
- * 🧾 レシート解析システム - 重複防止修正版（Azure SQL 1テーブル）
+ * 🧾 レシート解析システム - 完全統合版 (Azure SQL 1テーブル構成)
  */
 
+// --- 1. 設定と環境構成 ---
 @set_time_limit(600);
 @ini_set('memory_limit', '512M');
 
@@ -21,50 +22,75 @@ $connectionOptions = array(
 
 $conn = sqlsrv_connect($serverName, $connectionOptions);
 if ($conn === false) {
-    die(print_r(sqlsrv_errors(), true));
+    die("<pre>" . print_r(sqlsrv_errors(), true) . "</pre>");
 }
 
-/* ===== 重複判定関数（★追加） ===== */
-function isDuplicateItem(array $items, string $name, int $price): bool {
-    foreach ($items as $it) {
-        if ($it['name'] === $name && $it['price'] === $price) {
-            return true;
+// --- 3. アクション処理 ---
+if (isset($_GET['action'])) {
+    $action = $_GET['action'];
+    
+    // CSVエクスポート (新しいReceiptsテーブル構造用)
+    if ($action == 'csv') {
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename=receipt_export_'.date('Ymd').'.csv');
+        echo "\xEF\xBB\xBF"; // UTF-8 BOM
+        $output = fopen('php://output', 'w');
+        fputcsv($output, ['ID', 'バッチID', 'ファイル名', '項目名', '金額', '合計フラグ', '登録日時']);
+        
+        $sql = "SELECT id, upload_batch_id, file_name, item_name, price, is_total, created_at FROM Receipts ORDER BY id DESC";
+        $stmt = sqlsrv_query($conn, $sql);
+        while ($row = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_ASSOC)) {
+            fputcsv($output, [
+                $row['id'],
+                $row['upload_batch_id'],
+                $row['file_name'],
+                $row['item_name'],
+                $row['price'],
+                $row['is_total'],
+                $row['created_at']->format('Y-m-d H:i:s')
+            ]);
+        }
+        fclose($output); exit;
+    }
+
+    // ログダウンロード
+    if ($action == 'download_log') {
+        if (file_exists($logFile)) {
+            header('Content-Type: text/plain');
+            header('Content-Disposition: attachment; filename="ocr.log"');
+            readfile($logFile); exit;
         }
     }
-    return false;
+
+    // 表示をクリア
+    if ($action == 'clear_view') {
+        header("Location: " . strtok($_SERVER["PHP_SELF"], '?'));
+        exit;
+    }
 }
 
+// --- 4. OCR 解析 & DB保存ロジック ---
 $results = [];
 $totalAllAmount = 0;
 
-/* ===== OCR処理 ===== */
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
-
-    $batchId = uniqid('BT_');
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
+    $batchId = uniqid('BT_'); // アップロード毎の識別ID
 
     foreach ($_FILES['receipts']['tmp_name'] as $key => $tmpName) {
-
-        if (!$tmpName) continue;
-        if ($key > 0) sleep(1);
+        if (empty($tmpName)) continue;
+        if ($key > 0) sleep(1); // API負荷軽減
 
         $fileName = $_FILES['receipts']['name'][$key];
-        $imgData  = file_get_contents($tmpName);
-
-        $apiUrl = rtrim($endpoint, '/') .
-            "/computervision/imageanalysis:analyze?api-version=2023-10-01&features=read";
-
+        $imgData = file_get_contents($tmpName);
+        $apiUrl = rtrim($endpoint, '/') . "/computervision/imageanalysis:analyze?api-version=2023-10-01&features=read";
+        
         $ch = curl_init($apiUrl);
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/octet-stream',
-                'Ocp-Apim-Subscription-Key: ' . $apiKey
-            ],
-            CURLOPT_POSTFIELDS => $imgData,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_TIMEOUT => 60
-        ]);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/octet-stream', 'Ocp-Apim-Subscription-Key: ' . $apiKey]);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $imgData);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 60);
 
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -72,121 +98,235 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
 
         if ($httpCode !== 200) continue;
 
-        $data  = json_decode($response, true);
+        $data = json_decode($response, true);
         $lines = $data['readResult']['blocks'][0]['lines'] ?? [];
-
         $currentItems = [];
+        $processedItems = []; // 処理済み商品を追跡
+        $logStore = "不明な店舗";
         $logTotal = 0;
         $stopFlag = false;
 
         for ($i = 0; $i < count($lines); $i++) {
-
             $text = trim($lines[$i]['text']);
-            $pure = str_replace([' ', '　', '＊', '*', '轻', '軽', '(', ')', '8%', '10%'], '', $text);
-
-            /* 合計 */
-            if (preg_match('/合計/u', $pure) && preg_match('/[¥￥]([\d,]+)/u', $text, $m)) {
-                $logTotal = (int)str_replace(',', '', $m[1]);
+            if ($i < 5 && preg_match('/FamilyMart|セブン|ローソン|LAWSON/i', $text, $storeMatch)) {
+                $logStore = $storeMatch[0];
             }
 
-            /* 停止ワード */
-            if (preg_match('/内消費税|消費税|対象|支払|残高/u', $pure)) {
-                $stopFlag = true;
-                continue;
+            $pureText = str_replace([' ', '　', '＊', '*', '√', '軽', '轻', '(', ')', '8%', '10%'], '', $text);
+
+            // 合計金額の判定
+            if (preg_match('/合計|合計額/u', $pureText) && preg_match('/[¥￥]([\d,]+)/u', $text, $totalMatch)) {
+                $logTotal = (int)str_replace(',', '', $totalMatch[1]);
             }
+
+            // 解析停止ワードの判定を強化
+            $stopKeywords = [
+                '内消費税', '消費税', '対象', '支払', '残高', '再発行', 
+                '交通系', 'マナー', 'カード', '番号', 'QRコード', 'クーポン',
+                '受け取り', '期限', 'アプリ', 'ファミペイ', 'ファミマ', '残額',
+                '領収証', '登録番号', '電話', '店舗', '店', 'レジ', '軽減税率'
+            ];
+            
+            foreach ($stopKeywords as $keyword) {
+                if (strpos($text, $keyword) !== false) {
+                    $stopFlag = true;
+                    break;
+                }
+            }
+            
             if ($stopFlag) continue;
 
-            /* 金額検出 */
-            if (preg_match('/[¥￥]([\d,]+)/u', $text, $m)) {
+            // 商品と金額の抽出
+            if (preg_match('/[¥￥]([\d,]+)/u', $text, $matches)) {
+                $price = (int)str_replace(',', '', $matches[1]);
+                $nameInLine = trim(preg_replace('/[\.．…]+|[¥￥].*$/u', '', $text));
+                
+                // 商品名の正規化を強化
+                $cleanNameInLine = preg_replace('/[＊*轻軽()\.．\s　]/u', '', $nameInLine);
+                $cleanNameInLine = preg_replace('/^[◎●○■▲◆★※]+/u', '', $cleanNameInLine); // 記号を除去
+                $cleanNameInLine = trim($cleanNameInLine);
 
-                $price = (int)str_replace(',', '', $m[1]);
-                $name  = trim(preg_replace('/[¥￥].*/u', '', $text));
-                $name  = str_replace(['＊','*',' ','軽','轻','(',')','.','．'], '', $name);
-
-                if (mb_strlen($name) < 2) {
-                    for ($j = $i - 1; $j >= 0; $j--) {
+                // 短すぎる名前の処理
+                if (mb_strlen($cleanNameInLine) < 2 || preg_match('/^[¥￥\d,\s]+$/u', $cleanNameInLine)) {
+                    $foundName = "";
+                    // 最大3行前まで遡って検索
+                    for ($j = $i - 1; $j >= max(0, $i - 3); $j--) {
                         $prev = trim($lines[$j]['text']);
-                        $prev = str_replace(['＊','*',' ','軽','轻'], '', $prev);
-                        if (mb_strlen($prev) >= 2 && !preg_match('/合計|%|電話|領収/u', $prev)) {
-                            $name = $prev;
+                        $cleanPrev = preg_replace('/[＊*轻軽\s√　]/u', '', $prev);
+                        $cleanPrev = preg_replace('/^[◎●○■▲◆★※]+/u', '', $cleanPrev);
+                        $cleanPrev = trim($cleanPrev);
+                        
+                        if (mb_strlen($cleanPrev) >= 2 && 
+                            !preg_match('/領|収|証|合|計|%|店|電話|¥|￥|\d{4}|\d{3}-\d{4}/u', $cleanPrev) &&
+                            !preg_match('/[¥￥]\d+/u', $cleanPrev)) {
+                            $foundName = $cleanPrev;
+                            // すでに処理済みの商品名でないかチェック
+                            if (isset($processedItems[$foundName])) {
+                                $foundName = ""; // 処理済みなら無視
+                            }
                             break;
                         }
                     }
+                    $finalName = $foundName;
+                } else {
+                    $finalName = $cleanNameInLine;
                 }
 
-                if ($name && !isDuplicateItem($currentItems, $name, $price)) {
-                    $currentItems[] = [
-                        'name'  => $name,
-                        'price' => $price
-                    ];
+                // 最終的な商品名の検証
+                if (!empty($finalName) && 
+                    mb_strlen($finalName) >= 2 &&
+                    !preg_match('/Family|新宿|電話|登録|領収|対象|消費税|合計|内訳|レジ|軽減|税率|QR|コード|クーポン/u', $finalName) &&
+                    !isset($processedItems[$finalName])) {
+                    
+                    $currentItems[] = ['name' => $finalName, 'price' => $price];
+                    $processedItems[$finalName] = true; // 処理済みとしてマーク
                 }
             }
         }
 
-        /* DB保存 */
+        // --- DB保存実行 ---
         foreach ($currentItems as $it) {
-            sqlsrv_query(
-                $conn,
-                "INSERT INTO Receipts (upload_batch_id, file_name, item_name, price, is_total)
-                 VALUES (?, ?, ?, ?, 0)",
-                [$batchId, $fileName, $it['name'], $it['price']]
-            );
+            $sql = "INSERT INTO Receipts (upload_batch_id, file_name, item_name, price, is_total) VALUES (?, ?, ?, ?, 0)";
+            sqlsrv_query($conn, $sql, [$batchId, $fileName, $it['name'], $it['price']]);
             $totalAllAmount += $it['price'];
         }
-
+        
+        // 合計金額の保存（重複防止）
         if ($logTotal > 0) {
-            sqlsrv_query(
-                $conn,
-                "INSERT INTO Receipts (upload_batch_id, file_name, item_name, price, is_total)
-                 VALUES (?, ?, '合計(OCR)', ?, 1)",
-                [$batchId, $fileName, $logTotal]
-            );
+            $checkSql = "SELECT COUNT(*) as cnt FROM Receipts WHERE upload_batch_id = ? AND file_name = ? AND item_name = ?";
+            $checkParams = [$batchId, $fileName, '合計(OCR読み取り)'];
+            $checkStmt = sqlsrv_query($conn, $checkSql, $checkParams);
+            $checkRow = sqlsrv_fetch_array($checkStmt, SQLSRV_FETCH_ASSOC);
+            
+            if ($checkRow['cnt'] == 0) {
+                $sql = "INSERT INTO Receipts (upload_batch_id, file_name, item_name, price, is_total) VALUES (?, ?, ?, ?, 1)";
+                sqlsrv_query($conn, $sql, [$batchId, $fileName, '合計(OCR読み取り)', $logTotal]);
+            }
         }
 
-        $results[] = [
-            'file'  => $fileName,
-            'items' => $currentItems,
-            'total' => $logTotal
-        ];
+        $results[] = ['file' => $fileName, 'items' => $currentItems, 'total' => $logTotal];
+
+        // ログ書き出し
+        $logContent = sprintf("\n[%s] STORE:%s, FILE:%s, TOTAL:%d\n", date('Y-m-d H:i:s'), $logStore, $fileName, $logTotal);
+        foreach ($currentItems as $it) { 
+            $logContent .= "- {$it['name']}: {$it['price']}\n"; 
+        }
+        file_put_contents($logFile, $logContent, FILE_APPEND);
     }
 }
 ?>
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-<meta charset="UTF-8">
-<title>レシート解析</title>
-<style>
-body{font-family:sans-serif;background:#f4f7f9;padding:20px}
-.box{max-width:600px;margin:auto;background:#fff;padding:25px;border-radius:10px}
-.row{display:flex;justify-content:space-between;border-bottom:1px dashed #eee;padding:5px 0}
-.total{font-size:28px;color:#e74c3c;text-align:center;margin-top:20px}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>レシート解析システム (Azure SQL 統合版)</title>
+    <style>
+        body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #f4f7f9; padding: 20px; color: #333; }
+        .box { max-width: 600px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.05); }
+        .card { border-left: 4px solid #2ecc71; background: #fafafa; padding: 15px; margin-bottom: 15px; border-radius: 6px; }
+        .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed #eee; font-size: 14px; }
+        .grand-total { margin-top: 25px; padding: 20px; background: #fff5f5; border: 1px solid #ffccc7; border-radius: 10px; text-align: center; }
+        .amount-big { font-size: 32px; font-weight: bold; color: #ff4d4f; }
+        .btn-main { width: 100%; padding: 15px; background: #1890ff; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }
+        .nav-bar { margin-top: 25px; display: flex; justify-content: space-around; border-top: 1px solid #eee; padding-top: 15px; flex-wrap: wrap; gap: 10px; }
+        .nav-link { font-size: 12px; color: #666; text-decoration: none; padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; background: #fff; }
+    </style>
 </head>
 <body>
-<div class="box">
-<h2>📜 レシート解析</h2>
+    <div class="box">
+        <h2 style="text-align:center;">📜 レシート解析システム</h2>
+        
+        <form id="uploadForm" method="post" enctype="multipart/form-data">
+            <input type="file" id="fileInput" name="receipts[]" multiple required style="margin-bottom:20px; width: 100%;">
+            <button type="submit" id="submitBtn" class="btn-main">解析を開始してDBに保存</button>
+            <div id="status" style="display:none; text-align:center; margin-top:10px; color:#1890ff;">準備中...</div>
+        </form>
 
-<form method="post" enctype="multipart/form-data">
-<input type="file" name="receipts[]" multiple required>
-<button>解析開始</button>
-</form>
+        <?php if (!empty($results)): ?>
+            <div style="margin-top:30px;">
+                <h3 style="font-size: 16px; color: #1890ff;">✅ 今回の解析結果:</h3>
+                <?php foreach ($results as $res): ?>
+                    <div class="card">
+                        <small style="color:#aaa;">📄 ファイル: <?= htmlspecialchars($res['file']) ?></small>
+                        <?php foreach ($res['items'] as $it): ?>
+                            <div class="row">
+                                <span><?= htmlspecialchars($it['name']) ?></span>
+                                <span>¥<?= number_format($it['price']) ?></span>
+                            </div>
+                        <?php endforeach; ?>
+                        <?php if($res['total'] > 0): ?>
+                            <div class="row" style="color:#ff4d4f; font-weight:bold; border-top:1px solid #ddd;">
+                                <span>(OCR読取合計)</span>
+                                <span>¥<?= number_format($res['total']) ?></span>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                <?php endforeach; ?>
+                
+                <div class="grand-total">
+                    <div>今回の商品合計</div>
+                    <div class="amount-big">¥<?= number_format($totalAllAmount) ?></div>
+                </div>
+            </div>
+        <?php endif; ?>
 
-<?php if ($results): ?>
-<hr>
-<?php foreach ($results as $r): ?>
-<b><?= htmlspecialchars($r['file']) ?></b>
-<?php foreach ($r['items'] as $it): ?>
-<div class="row">
-<span><?= htmlspecialchars($it['name']) ?></span>
-<span>¥<?= number_format($it['price']) ?></span>
-</div>
-<?php endforeach; ?>
-<?php endforeach; ?>
-<div class="total">¥<?= number_format($totalAllAmount) ?></div>
-<?php endif; ?>
+        <div class="nav-bar">
+            <a href="?action=csv" class="nav-link">📥 CSVを保存</a>
+            <a href="?action=download_log" class="nav-link">📝 ログを保存</a>
+            <a href="?action=clear_view" class="nav-link" style="color:#1890ff;">🔄 表示クリア</a>
+        </div>
+    </div>
 
-</div>
+    <script>
+    document.getElementById('uploadForm').onsubmit = async function(e) {
+        e.preventDefault();
+        const btn = document.getElementById('submitBtn');
+        const status = document.getElementById('status');
+        const files = document.getElementById('fileInput').files;
+        if (!files.length) return;
+
+        btn.disabled = true;
+        status.style.display = "block";
+
+        const formData = new FormData();
+        for (let i = 0; i < files.length; i++) {
+            status.innerText = `画像を圧縮中 (${i+1}/${files.length})...`;
+            const compressed = await compressImg(files[i]);
+            formData.append('receipts[]', compressed, files[i].name);
+        }
+
+        status.innerText = "Azure OCR で解析中...";
+        fetch('', { method: 'POST', body: formData })
+        .then(r => r.text())
+        .then(html => {
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            document.body.innerHTML = doc.body.innerHTML;
+        })
+        .catch(err => {
+            alert("エラーが発生しました。");
+            btn.disabled = false;
+        });
+    };
+
+    function compressImg(file) {
+        return new Promise(resolve => {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = (e) => {
+                const img = new Image();
+                img.src = e.target.result;
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    let w = img.width, h = img.height;
+                    if (w > 1200) { h = h * (1200/w); w = 1200; }
+                    canvas.width = w; canvas.height = h;
+                    canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+                    canvas.toBlob(blob => resolve(new File([blob], file.name, {type:'image/jpeg'})), 'image/jpeg', 0.85);
+                };
+            };
+        });
+    }
+    </script>
 </body>
 </html>
-
