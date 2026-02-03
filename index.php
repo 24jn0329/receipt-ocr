@@ -6,6 +6,8 @@
 // --- 1. 設定と環境構成 ---
 @set_time_limit(600);
 @ini_set('memory_limit', '512M');
+@ini_set('upload_max_filesize', '20M'); // PHP側の制限も一応引き上げ
+@ini_set('post_max_size', '20M');
 
 $endpoint = "https://cv-receipt.cognitiveservices.azure.com/"; 
 $apiKey   = "acFa9r1gRfWfvNsBjsLFsyec437ihmUsWXpA1WKVYD4z5yrPBrrMJQQJ99CBACNns7RXJ3w3AAAFACOGcllL"; 
@@ -101,7 +103,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
         $logStore = "不明な店舗";
         $logTotal = 0;
         $stopFlag = false;
-        $usedBufferIndex = -1; // 使用済みの商品名インデックスを追跡
+        $usedBufferIndex = -1;
 
         for ($i = 0; $i < count($lines); $i++) {
             $text = trim($lines[$i]['text']);
@@ -111,47 +113,39 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
 
             $pureText = str_replace([' ', '　', '＊', '*', '√', '軽', '轻', '(', ')', '8%', '10%'], '', $text);
 
-            // 合計金額の判定
             if (preg_match('/合計|合計額/u', $pureText) && preg_match('/[¥￥]([\d,]+)/u', $text, $totalMatch)) {
                 $logTotal = (int)str_replace(',', '', $totalMatch[1]);
-                $stopFlag = true; // 合計が見つかったら以降の商品解析を停止
+                $stopFlag = true;
             }
 
-            // 解析停止ワード
             if (preg_match('/内消費税|消費税|対象|支払|残高|再発行/u', $pureText)) {
                 $stopFlag = true;
                 continue;
             }
             if ($stopFlag) continue;
 
-            // 商品と金額の抽出 (重複防止強化版)
             if (preg_match('/[¥￥]([\d,]+)/u', $text, $matches)) {
                 $price = (int)str_replace(',', '', $matches[1]);
                 $nameInLine = trim(preg_replace('/[\.．…]+|[¥￥].*$/u', '', $text));
                 $cleanNameInLine = str_replace(['＊', '*', '轻', '軽', '(', ')', '.', '．', ' '], '', $nameInLine);
 
                 $finalName = "";
-
-                // 1. 同じ行に名前があるかチェック
                 if (mb_strlen($cleanNameInLine) >= 2 && !preg_match('/^[¥￥\d,\s]+$/u', $cleanNameInLine)) {
                     $finalName = $cleanNameInLine;
                 } 
-                // 2. 行に名前がない場合、前の行から探索
                 else {
                     for ($j = $i - 1; $j > $usedBufferIndex; $j--) {
                         $prev = trim($lines[$j]['text']);
                         $cleanPrev = str_replace(['＊', '*', ' ', '√', '軽', '轻', '◎'], '', $prev);
                         if (mb_strlen($cleanPrev) >= 2 && !preg_match('/領|収|証|合|計|%|店|電話|¥|￥|No/u', $cleanPrev)) {
-                            $finalName = str_replace(['＊', '*', ' ', '√', '軽', '轻'], '', $prev); // ◎を含めて取得
-                            $usedBufferIndex = $j; // この行は使用済みとする
+                            $finalName = str_replace(['＊', '*', ' ', '√', '軽', '推'], '', $prev);
+                            $usedBufferIndex = $j;
                             break;
                         }
                     }
                 }
 
-                // 最終チェックと追加
                 if (!empty($finalName) && !preg_match('/Family|新宿|電話|登録|領収|対象|消費税|合計|内訳/u', $finalName)) {
-                    // 同一ファイル内での完全一致重複を避ける（OCRの二重読み対策）
                     $isDuplicate = false;
                     foreach ($currentItems as $item) {
                         if ($item['name'] === $finalName && $item['price'] === $price) {
@@ -165,7 +159,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
             }
         }
 
-        // --- DB保存実行 ---
         foreach ($currentItems as $it) {
             $sql = "INSERT INTO Receipts (upload_batch_id, file_name, item_name, price, is_total) VALUES (?, ?, ?, ?, 0)";
             sqlsrv_query($conn, $sql, [$batchId, $fileName, $it['name'], $it['price']]);
@@ -178,7 +171,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
 
         $results[] = ['file' => $fileName, 'items' => $currentItems, 'total' => $logTotal];
 
-        // ログ書き出し
         $logContent = sprintf("\n[%s] STORE:%s, FILE:%s, TOTAL:%d\n", date('Y-m-d H:i:s'), $logStore, $fileName, $logTotal);
         foreach ($currentItems as $it) { $logContent .= "- {$it['name']}: {$it['price']}\n"; }
         file_put_contents($logFile, $logContent, FILE_APPEND);
@@ -268,14 +260,20 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
 
         status.innerText = "Azure OCR で解析中...";
         fetch('', { method: 'POST', body: formData })
-        .then(r => r.text())
+        .then(async r => {
+            if (r.status === 413) {
+                throw new Error("ファイルサイズが大きすぎます(Nginx 413)。枚数を減らすか管理者に相談してください。");
+            }
+            return r.text();
+        })
         .then(html => {
             const doc = new DOMParser().parseFromString(html, 'text/html');
             document.body.innerHTML = doc.body.innerHTML;
         })
         .catch(err => {
-            alert("エラーが発生しました。");
+            alert(err.message || "エラーが発生しました。");
             btn.disabled = false;
+            status.style.display = "none";
         });
     };
 
@@ -289,10 +287,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
                 img.onload = () => {
                     const canvas = document.createElement('canvas');
                     let w = img.width, h = img.height;
-                    if (w > 1200) { h = h * (1200/w); w = 1200; }
+                    // Nginxの413回避のため、最大幅を1200->1000に下げ、画質を0.85->0.7に調整
+                    const maxSide = 1000;
+                    if (w > maxSide || h > maxSide) {
+                        if (w > h) { h = h * (maxSide/w); w = maxSide; }
+                        else { w = w * (maxSide/h); h = maxSide; }
+                    }
                     canvas.width = w; canvas.height = h;
                     canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-                    canvas.toBlob(blob => resolve(new File([blob], file.name, {type:'image/jpeg'})), 'image/jpeg', 0.85);
+                    canvas.toBlob(blob => resolve(new File([blob], file.name, {type:'image/jpeg'})), 'image/jpeg', 0.7);
                 };
             };
         });
