@@ -88,10 +88,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
 
         for ($i = 0; $i < count($lines); $i++) {
             $text = trim($lines[$i]['text']);
-            // 判定用のクリーニング（記号や税率を消す）
+            // クリーニング：記号や税率表記を除去
             $pureText = str_replace([' ', '　', '＊', '*', '√', '軽', '轻', '(', ')', '8%', '10%', '税'], '', $text);
 
-            // ① 合計金額の判定（ここでストップをかけるが、金額自体は取得する）
+            // ① 合計金額の検出（判定用。この行以降は商品解析を停止する準備）
             if (preg_match('/合計|合計額|小計/u', $pureText)) {
                 if (preg_match('/[¥￥]([\d,]+)/u', $text, $totalMatch)) {
                     $logTotal = (int)str_replace(',', '', $totalMatch[1]);
@@ -100,7 +100,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
                 continue;
             }
 
-            // ② 終了トリガー
+            // ② 支払い関連などの終了キーワード
             if (preg_match('/支払|残高|再発行|クレジット|預り|釣銭/u', $pureText)) {
                 $stopFlag = true;
                 continue;
@@ -112,16 +112,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
             if (preg_match('/[¥￥]([\d,]+)/u', $text, $matches)) {
                 $price = (int)str_replace(',', '', $matches[1]);
                 
-                // 金額以外の部分を名前として抽出
+                // 行内から金額以外の部分を抽出
                 $namePart = trim(preg_replace('/[¥￥][\d,]+.*/u', '', $text));
                 $cleanName = str_replace(['＊', '*', '轻', '軽', '(', ')', '.', '．', ' ', '　'], '', $namePart);
 
-                // 【重要】名前が空、または短すぎる場合は、上の行を「商品名」として採用する
+                // 【修正ポイント】名前が空または短すぎる場合、上の行から名前を取得
                 if (mb_strlen($cleanName) < 1) {
                     for ($j = $i - 1; $j >= 0; $j--) {
                         $prevText = trim($lines[$j]['text']);
-                        // 明らかに商品名でない行（住所、電話、ロゴなど）は避ける
-                        if (preg_match('/Family|新宿|電話|番号|登録|領収|http/u', $prevText)) break;
+                        // 住所、電話、タイトル、空行などはスキップ
+                        if (preg_match('/Family|新宿|電話|番号|登録|領収|証|http/u', $prevText)) break;
                         
                         $cleanPrev = str_replace(['＊', '*', ' ', '　', '√', '軽', '轻'], '', $prevText);
                         if (mb_strlen($cleanPrev) >= 2) {
@@ -131,8 +131,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
                     }
                 }
 
-                // 最終チェック：店舗情報やヘッダー文字を除外して保存
-                if (!empty($cleanName) && !preg_match('/Family|新宿|電話|登録|領収|対象|消費税|合計|内訳/u', $cleanName)) {
+                // 最终过滤并存储结果
+                if (!empty($cleanName) && !preg_match('/Family|新宿|電話|登録|領収|証|対象|消費税|合計|内訳/u', $cleanName)) {
                     $currentItems[] = ['name' => $cleanName, 'price' => $price];
                 }
             }
