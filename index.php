@@ -1,6 +1,7 @@
 <?php
 /**
- * 🧾 レシート解析システム - 逐次アップロード・リアルタイム合計版
+ * 🧾 Smart Receipt AI - 完整集成美化版
+ * 功能：Azure OCR, Azure SQL, 逐张异步上传 (绕过 Nginx 413 限制), 实时总计
  */
 
 // --- 1. 設定と環境構成 ---
@@ -54,7 +55,7 @@ if (isset($_GET['action'])) {
     }
 }
 
-// --- 4. OCR 解析 & DB保存 (Ajax逐次処理用) ---
+// --- 4. AJAX POST 処理 (逐次アップロード用) ---
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
     $batchId = $_POST['batch_id'] ?? uniqid('BT_');
     foreach ($_FILES['receipts']['tmp_name'] as $key => $tmpName) {
@@ -75,9 +76,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
         curl_close($ch);
 
         if ($httpCode !== 200) {
-            http_response_code(500);
-            echo json_encode(['error' => 'API Error']);
-            exit;
+            header('HTTP/1.1 500 Internal Server Error');
+            echo json_encode(['error' => 'OCR API Error']); exit;
         }
 
         $data = json_decode($response, true);
@@ -119,11 +119,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
             }
         }
 
-        $singleFileSum = 0;
+        $sumOfItems = 0;
         foreach ($currentItems as $it) {
             $sql = "INSERT INTO Receipts (upload_batch_id, file_name, item_name, price, is_total) VALUES (?, ?, ?, ?, 0)";
             sqlsrv_query($conn, $sql, [$batchId, $fileName, $it['name'], $it['price']]);
-            $singleFileSum += $it['price'];
+            $sumOfItems += $it['price'];
         }
         if ($logTotal > 0) {
             $sql = "INSERT INTO Receipts (upload_batch_id, file_name, item_name, price, is_total) VALUES (?, ?, ?, ?, 1)";
@@ -131,7 +131,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
         }
         
         header('Content-Type: application/json');
-        echo json_encode(['file' => $fileName, 'items' => $currentItems, 'total' => $logTotal, 'sum' => $singleFileSum]);
+        echo json_encode(['file' => $fileName, 'items' => $currentItems, 'total' => $logTotal, 'sum' => $sumOfItems]);
         exit;
     }
 }
@@ -141,44 +141,196 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>レシート解析システム</title>
+    <title>Smart Receipt AI - 解析システム</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
     <style>
-        body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #f4f7f9; padding: 20px; color: #333; }
-        .box { max-width: 600px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.05); }
-        .card { border-left: 4px solid #2ecc71; background: #fafafa; padding: 15px; margin-bottom: 15px; border-radius: 6px; }
-        .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed #eee; font-size: 14px; }
-        .btn-main { width: 100%; padding: 15px; background: #1890ff; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }
-        .btn-main:disabled { background: #ccc; }
-        .grand-total-box { margin-top: 25px; padding: 20px; background: #fff5f5; border: 1px solid #ffccc7; border-radius: 10px; text-align: center; }
-        .amount-big { font-size: 32px; font-weight: bold; color: #ff4d4f; }
-        .nav-bar { margin-top: 25px; display: flex; justify-content: space-around; border-top: 1px solid #eee; padding-top: 15px; }
-        .nav-link { font-size: 12px; color: #666; text-decoration: none; padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; background: #fff; }
+        :root {
+            --primary: #4361ee;
+            --secondary: #3f37c9;
+            --success: #4cc9f0;
+            --danger: #f72585;
+            --bg: #f8f9fd;
+            --card-bg: #ffffff;
+            --text-main: #2b2d42;
+            --text-muted: #8d99ae;
+        }
+
+        body { 
+            font-family: 'Inter', sans-serif; 
+            background: var(--bg); 
+            padding: 20px; 
+            color: var(--text-main);
+            line-height: 1.6;
+        }
+
+        .box { 
+            max-width: 650px; 
+            margin: 40px auto; 
+            background: var(--card-bg); 
+            padding: 40px; 
+            border-radius: 24px; 
+            box-shadow: 0 20px 60px rgba(0,0,0,0.05);
+        }
+
+        h2 { 
+            text-align: center; 
+            font-weight: 700; 
+            font-size: 26px;
+            margin-bottom: 30px;
+            letter-spacing: -0.5px;
+            color: var(--primary);
+        }
+
+        /* アップロードエリア */
+        .upload-section {
+            background: #f1f4ff;
+            border: 2px dashed #adc1ff;
+            border-radius: 16px;
+            padding: 40px 20px;
+            text-align: center;
+            transition: all 0.3s ease;
+            margin-bottom: 25px;
+        }
+
+        .upload-section:hover { border-color: var(--primary); background: #ebf0ff; }
+
+        input[type="file"] { margin: 15px 0; font-size: 14px; width: 100%; max-width: 250px; }
+
+        /* ボタン */
+        .btn-main { 
+            width: 100%; 
+            padding: 18px; 
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white; 
+            border: none; 
+            border-radius: 14px; 
+            font-size: 16px; 
+            font-weight: 600; 
+            cursor: pointer; 
+            transition: all 0.2s ease;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .btn-main:hover { transform: translateY(-2px); box-shadow: 0 10px 25px rgba(67, 97, 238, 0.3); }
+        .btn-main:disabled { background: #cbd5e0; transform: none; box-shadow: none; cursor: not-allowed; }
+
+        /* ステータス表示 */
+        #status {
+            text-align: center;
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 12px;
+            background: #e7f0ff;
+            color: var(--primary);
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        /* 解析結果カード */
+        .card { 
+            background: #fff;
+            border: 1px solid #edf2f7;
+            padding: 20px; 
+            margin-bottom: 15px; 
+            border-radius: 18px; 
+            animation: slideIn 0.4s ease forwards;
+        }
+
+        @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+        .file-info { font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px; }
+
+        .row { 
+            display: flex; 
+            justify-content: space-between; 
+            padding: 10px 0; 
+            border-bottom: 1px solid #f8f9fa;
+        }
+
+        .row span:first-child { color: #4a5568; font-weight: 500; font-size: 14px; }
+        .row span:last-child { font-family: 'Monaco', 'Courier New', monospace; font-weight: 700; color: var(--text-main); }
+
+        /* 合計金額ボックス */
+        .grand-total-box { 
+            margin-top: 35px; 
+            padding: 30px; 
+            background: var(--text-main);
+            color: white;
+            border-radius: 22px; 
+            text-align: center;
+            box-shadow: 0 20px 40px rgba(43, 45, 66, 0.2);
+        }
+
+        .grand-total-box div:first-child { font-size: 14px; opacity: 0.7; margin-bottom: 8px; }
+        .amount-big { font-size: 40px; font-weight: 800; color: var(--success); }
+
+        /* ナビゲーション */
+        .nav-bar { 
+            margin-top: 45px; 
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 12px;
+        }
+
+        .nav-link { 
+            font-size: 12px; 
+            color: var(--text-muted); 
+            text-decoration: none; 
+            padding: 12px; 
+            border: 1px solid #e2e8f0; 
+            border-radius: 12px; 
+            text-align: center;
+            transition: all 0.2s;
+            background: white;
+        }
+
+        .nav-link:hover { background: #f8f9fa; border-color: var(--text-muted); color: var(--text-main); }
+        .nav-link i { display: block; font-size: 20px; margin-bottom: 6px; }
+
+        #resultsArea h3 { font-size: 18px; margin: 30px 0 15px; color: var(--primary); display: flex; align-items: center; gap: 8px; }
     </style>
 </head>
 <body>
     <div class="box">
-        <h2 style="text-align:center;">📜 レシート解析システム</h2>
-        <input type="file" id="fileInput" multiple style="margin-bottom:20px; width: 100%;">
-        <button id="submitBtn" class="btn-main">解析を開始（DB保存）</button>
+        <h2><i class="fa-solid fa-receipt"></i> Smart Receipt AI</h2>
         
-        <div id="status" style="display:none; text-align:center; margin-top:10px; color:#1890ff; font-weight:bold;"></div>
+        <div class="upload-section">
+            <i class="fa-solid fa-cloud-arrow-up" style="font-size: 48px; color: var(--primary); margin-bottom: 15px; display: block;"></i>
+            <p style="font-weight:600; margin-bottom:5px;">画像をアップロード</p>
+            <input type="file" id="fileInput" multiple accept="image/*">
+            <p style="font-size: 11px; color: var(--text-muted);">複数枚のレシートをまとめてスキャンできます</p>
+        </div>
+
+        <button id="submitBtn" class="btn-main">
+            <i class="fa-solid fa-wand-magic-sparkles"></i>
+            解析を開始してDBに保存
+        </button>
         
-        <div id="resultsArea" style="margin-top:20px;"></div>
+        <div id="status" style="display:none;">
+            <i class="fa-solid fa-spinner fa-spin"></i> <span id="statusText">接続中...</span>
+        </div>
+        
+        <div id="resultsArea"></div>
 
         <div id="grandTotalContainer" class="grand-total-box" style="display:none;">
-            <div>今回の解析商品 合計金額</div>
+            <div><i class="fa-solid fa-chart-line"></i> 今回の解析商品 合計</div>
             <div class="amount-big">¥<span id="allFileSum">0</span></div>
         </div>
 
         <div class="nav-bar">
-            <a href="?action=csv" class="nav-link">📥 CSV保存</a>
-            <a href="?action=download_log" class="nav-link">📝 ログ表示</a>
-            <a href="?action=clear_view" class="nav-link" style="color:#1890ff;">🔄 クリア</a>
+            <a href="?action=csv" class="nav-link"><i class="fa-solid fa-file-csv"></i>CSV保存</a>
+            <a href="?action=download_log" class="nav-link"><i class="fa-solid fa-terminal"></i>ログ表示</a>
+            <a href="?action=clear_view" class="nav-link" style="color: var(--danger);"><i class="fa-solid fa-eraser"></i>クリア</a>
         </div>
     </div>
 
     <script>
-    let runningTotal = 0; // 全ファイルの合計金額を保持
+    let runningTotal = 0;
 
     document.getElementById('submitBtn').onclick = async function() {
         const fileInput = document.getElementById('fileInput');
@@ -193,10 +345,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
             return;
         }
 
-        // 初始化状态
         this.disabled = true;
         status.style.display = "block";
-        resultsArea.innerHTML = "<h3 style='font-size:16px; color:#1890ff;'>✅ 解析結果:</h3>";
+        resultsArea.innerHTML = "<h3><i class='fa-solid fa-circle-check'></i> 今回の解析結果:</h3>";
         totalContainer.style.display = "block";
         runningTotal = 0;
         totalDisplay.innerText = "0";
@@ -204,45 +355,45 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
         const batchId = "BT_" + Date.now();
 
         for (let i = 0; i < files.length; i++) {
-            status.innerText = `処理中 (${i + 1} / ${files.length}): ${files[i].name}`;
+            status.innerHTML = `<i class='fa-solid fa-spinner fa-spin'></i> 処理中 (${i + 1}/${files.length}): ${files[i].name}`;
             
             try {
-                // 1. 圧縮
+                // 1. 画像圧縮 (Nginx 413対策)
                 const compressed = await compressImg(files[i]);
                 
-                // 2. 1枚ずつ送信
+                // 2. 逐次送信 (1枚ずつ)
                 const formData = new FormData();
                 formData.append('receipts[]', compressed, files[i].name);
                 formData.append('batch_id', batchId);
 
                 const response = await fetch('', { method: 'POST', body: formData });
-                if (!response.ok) throw new Error("Upload Failed");
+                if (!response.ok) throw new Error("Upload Error");
                 
                 const resData = await response.json();
                 
-                // 3. 金額を累加
+                // 3. 合計加算
                 runningTotal += resData.sum;
                 totalDisplay.innerText = runningTotal.toLocaleString();
 
-                // 4. 表示更新
+                // 4. カード表示
                 renderResult(resData);
             } catch (err) {
-                resultsArea.innerHTML += `<div style="color:red; font-size:12px; margin-bottom:10px;">❌ ${files[i].name}: 解析に失敗しました。</div>`;
+                resultsArea.innerHTML += `<div style="color:var(--danger); font-size:12px; margin-bottom:15px; padding:10px; background:#fff0f6; border-radius:10px;">❌ ${files[i].name}: 解析失敗</div>`;
             }
         }
 
-        status.innerText = "✅ すべての解析が完了しました";
+        status.innerHTML = "<i class='fa-solid fa-check-double'></i> すべての解析が完了しました";
         this.disabled = false;
     };
 
     function renderResult(data) {
         const resultsArea = document.getElementById('resultsArea');
-        let html = `<div class="card"><small style="color:#aaa;">📄 ${data.file}</small>`;
+        let html = `<div class="card"><span class="file-info">File: ${data.file}</span>`;
         data.items.forEach(it => {
             html += `<div class="row"><span>${it.name}</span><span>¥${it.price.toLocaleString()}</span></div>`;
         });
         if (data.total > 0) {
-            html += `<div class="row" style="color:#ff4d4f; font-weight:bold; border-top:1px solid #eee; margin-top:5px;"><span>(OCR読取合計)</span><span>¥${data.total.toLocaleString()}</span></div>`;
+            html += `<div class="row" style="color:var(--danger); font-weight:bold; border-top:1px solid #eee; margin-top:5px;"><span>(OCR読取合計)</span><span>¥${data.total.toLocaleString()}</span></div>`;
         }
         html += `</div>`;
         resultsArea.insertAdjacentHTML('beforeend', html);
