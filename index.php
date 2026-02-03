@@ -1,6 +1,6 @@
 <?php
 /**
- * 🧾 レシート解析システム - 逐次アップロード版 (Nginx 413 回避)
+ * 🧾 レシート解析システム - 逐次アップロード・リアルタイム合計版
  */
 
 // --- 1. 設定と環境構成 ---
@@ -54,8 +54,7 @@ if (isset($_GET['action'])) {
     }
 }
 
-// --- 4. OCR 解析 & DB保存 (Ajax用) ---
-$results = [];
+// --- 4. OCR 解析 & DB保存 (Ajax逐次処理用) ---
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
     $batchId = $_POST['batch_id'] ?? uniqid('BT_');
     foreach ($_FILES['receipts']['tmp_name'] as $key => $tmpName) {
@@ -75,7 +74,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
-        if ($httpCode !== 200) continue;
+        if ($httpCode !== 200) {
+            http_response_code(500);
+            echo json_encode(['error' => 'API Error']);
+            exit;
+        }
 
         $data = json_decode($response, true);
         $lines = $data['readResult']['blocks'][0]['lines'] ?? [];
@@ -116,17 +119,19 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
             }
         }
 
+        $singleFileSum = 0;
         foreach ($currentItems as $it) {
             $sql = "INSERT INTO Receipts (upload_batch_id, file_name, item_name, price, is_total) VALUES (?, ?, ?, ?, 0)";
             sqlsrv_query($conn, $sql, [$batchId, $fileName, $it['name'], $it['price']]);
+            $singleFileSum += $it['price'];
         }
         if ($logTotal > 0) {
             $sql = "INSERT INTO Receipts (upload_batch_id, file_name, item_name, price, is_total) VALUES (?, ?, ?, ?, 1)";
             sqlsrv_query($conn, $sql, [$batchId, $fileName, '合計(OCR読み取り)', $logTotal]);
         }
         
-        // 解析結果の一部をJSONで返す（逐次表示用）
-        echo json_encode(['file' => $fileName, 'items' => $currentItems, 'total' => $logTotal]);
+        header('Content-Type: application/json');
+        echo json_encode(['file' => $fileName, 'items' => $currentItems, 'total' => $logTotal, 'sum' => $singleFileSum]);
         exit;
     }
 }
@@ -138,84 +143,109 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['receipts'])) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>レシート解析システム</title>
     <style>
-        body { font-family: sans-serif; background: #f4f7f9; padding: 20px; }
-        .box { max-width: 600px; margin: auto; background: white; padding: 25px; border-radius: 12px; }
-        .card { border-left: 4px solid #2ecc71; background: #fafafa; padding: 10px; margin-bottom: 10px; border-radius: 4px; font-size: 13px; }
-        .row { display: flex; justify-content: space-between; border-bottom: 1px dashed #eee; padding: 4px 0; }
-        .btn-main { width: 100%; padding: 15px; background: #1890ff; color: white; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; }
-        #resultsArea { margin-top: 20px; }
-        .nav-bar { margin-top: 20px; display: flex; gap: 10px; justify-content: center; }
-        .nav-link { font-size: 12px; text-decoration: none; color: #666; padding: 5px 10px; border: 1px solid #ddd; border-radius: 4px; }
+        body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #f4f7f9; padding: 20px; color: #333; }
+        .box { max-width: 600px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.05); }
+        .card { border-left: 4px solid #2ecc71; background: #fafafa; padding: 15px; margin-bottom: 15px; border-radius: 6px; }
+        .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed #eee; font-size: 14px; }
+        .btn-main { width: 100%; padding: 15px; background: #1890ff; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }
+        .btn-main:disabled { background: #ccc; }
+        .grand-total-box { margin-top: 25px; padding: 20px; background: #fff5f5; border: 1px solid #ffccc7; border-radius: 10px; text-align: center; }
+        .amount-big { font-size: 32px; font-weight: bold; color: #ff4d4f; }
+        .nav-bar { margin-top: 25px; display: flex; justify-content: space-around; border-top: 1px solid #eee; padding-top: 15px; }
+        .nav-link { font-size: 12px; color: #666; text-decoration: none; padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; background: #fff; }
     </style>
 </head>
 <body>
     <div class="box">
-        <h2 style="text-align:center;">📜 レシート解析</h2>
-        <input type="file" id="fileInput" multiple style="width:100%; margin-bottom:20px;">
-        <button id="submitBtn" class="btn-main">解析を開始</button>
-        <div id="status" style="display:none; text-align:center; margin-top:10px; color:#1890ff;"></div>
+        <h2 style="text-align:center;">📜 レシート解析システム</h2>
+        <input type="file" id="fileInput" multiple style="margin-bottom:20px; width: 100%;">
+        <button id="submitBtn" class="btn-main">解析を開始（DB保存）</button>
         
-        <div id="resultsArea"></div>
+        <div id="status" style="display:none; text-align:center; margin-top:10px; color:#1890ff; font-weight:bold;"></div>
+        
+        <div id="resultsArea" style="margin-top:20px;"></div>
+
+        <div id="grandTotalContainer" class="grand-total-box" style="display:none;">
+            <div>今回の解析商品 合計金額</div>
+            <div class="amount-big">¥<span id="allFileSum">0</span></div>
+        </div>
 
         <div class="nav-bar">
             <a href="?action=csv" class="nav-link">📥 CSV保存</a>
-            <a href="?action=download_log" class="nav-link">📝 ログ</a>
-            <a href="?action=clear_view" class="nav-link">🔄 クリア</a>
+            <a href="?action=download_log" class="nav-link">📝 ログ表示</a>
+            <a href="?action=clear_view" class="nav-link" style="color:#1890ff;">🔄 クリア</a>
         </div>
     </div>
 
     <script>
+    let runningTotal = 0; // 全ファイルの合計金額を保持
+
     document.getElementById('submitBtn').onclick = async function() {
         const fileInput = document.getElementById('fileInput');
         const resultsArea = document.getElementById('resultsArea');
         const status = document.getElementById('status');
+        const totalContainer = document.getElementById('grandTotalContainer');
+        const totalDisplay = document.getElementById('allFileSum');
         const files = fileInput.files;
-        if (!files.length) return;
+        
+        if (!files.length) {
+            alert("ファイルを選択してください。");
+            return;
+        }
 
+        // 初始化状态
         this.disabled = true;
         status.style.display = "block";
-        resultsArea.innerHTML = "<h3>解析結果:</h3>";
+        resultsArea.innerHTML = "<h3 style='font-size:16px; color:#1890ff;'>✅ 解析結果:</h3>";
+        totalContainer.style.display = "block";
+        runningTotal = 0;
+        totalDisplay.innerText = "0";
         
         const batchId = "BT_" + Date.now();
 
         for (let i = 0; i < files.length; i++) {
             status.innerText = `処理中 (${i + 1} / ${files.length}): ${files[i].name}`;
             
-            // 1. 圧縮
-            const compressed = await compressImg(files[i]);
-            
-            // 2. 1枚ずつ送信 (逐次送信)
-            const formData = new FormData();
-            formData.append('receipts[]', compressed, files[i].name);
-            formData.append('batch_id', batchId);
-
             try {
+                // 1. 圧縮
+                const compressed = await compressImg(files[i]);
+                
+                // 2. 1枚ずつ送信
+                const formData = new FormData();
+                formData.append('receipts[]', compressed, files[i].name);
+                formData.append('batch_id', batchId);
+
                 const response = await fetch('', { method: 'POST', body: formData });
-                if (!response.ok) throw new Error("Server Error: " + response.status);
+                if (!response.ok) throw new Error("Upload Failed");
+                
                 const resData = await response.json();
                 
-                // 3. 画面に1枚ずつ結果を表示
+                // 3. 金額を累加
+                runningTotal += resData.sum;
+                totalDisplay.innerText = runningTotal.toLocaleString();
+
+                // 4. 表示更新
                 renderResult(resData);
             } catch (err) {
-                resultsArea.innerHTML += `<div style="color:red;">❌ ${files[i].name}: 解析失敗 (${err.message})</div>`;
+                resultsArea.innerHTML += `<div style="color:red; font-size:12px; margin-bottom:10px;">❌ ${files[i].name}: 解析に失敗しました。</div>`;
             }
         }
 
-        status.innerText = "✅ すべての処理が完了しました";
+        status.innerText = "✅ すべての解析が完了しました";
         this.disabled = false;
     };
 
     function renderResult(data) {
         const resultsArea = document.getElementById('resultsArea');
-        let html = `<div class="card"><strong>📄 ${data.file}</strong>`;
+        let html = `<div class="card"><small style="color:#aaa;">📄 ${data.file}</small>`;
         data.items.forEach(it => {
             html += `<div class="row"><span>${it.name}</span><span>¥${it.price.toLocaleString()}</span></div>`;
         });
         if (data.total > 0) {
-            html += `<div class="row" style="color:red; font-weight:bold;"><span>合計(OCR)</span><span>¥${data.total.toLocaleString()}</span></div>`;
+            html += `<div class="row" style="color:#ff4d4f; font-weight:bold; border-top:1px solid #eee; margin-top:5px;"><span>(OCR読取合計)</span><span>¥${data.total.toLocaleString()}</span></div>`;
         }
         html += `</div>`;
-        resultsArea.innerHTML += html;
+        resultsArea.insertAdjacentHTML('beforeend', html);
     }
 
     function compressImg(file) {
